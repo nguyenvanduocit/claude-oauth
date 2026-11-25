@@ -16,6 +16,12 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::time::Duration;
+
+use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, kill, sigaction};
+use nix::sys::termios::{SetArg, Termios, tcgetattr, tcsetattr};
+use nix::unistd::{Pid, tcgetpgrp, tcsetpgrp};
+use process_wrap::std::{ChildWrapper, CommandWrap, KillOnDrop, ResetSigmask};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum OnLimit {
@@ -254,33 +260,144 @@ pub fn exec(account: Option<&Account>, args: &[OsString]) -> Result<()> {
     Err(error).with_context(|| format!("Could not start {}", claude.display()))
 }
 
+/// PID of the running Claude Code session, 0 when none.
 static CHILD: AtomicI32 = AtomicI32::new(0);
 
-fn set_interrupts(ignore: bool) {
-    let action = if ignore { libc::SIG_IGN } else { libc::SIG_DFL };
-    // SAFETY: changing the disposition of SIGINT/SIGQUIT has no memory-safety implications.
-    unsafe {
-        libc::signal(libc::SIGINT, action);
-        libc::signal(libc::SIGQUIT, action);
+/// How long Claude Code gets to exit after a forwarded SIGTERM/SIGHUP before SIGKILL:
+/// 10 seconds, or `$CLAUDE_OAUTH_KILL_GRACE` seconds.
+fn grace() -> Duration {
+    let seconds = std::env::var("CLAUDE_OAUTH_KILL_GRACE")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(10.0);
+    Duration::from_secs_f64(seconds)
+}
+
+/// Signal dispositions and terminal state that claude-oauth changes while Claude Code runs.
+/// Dropping it restores them, so a crashed session cannot leave the terminal raw or the
+/// wrapper deaf to Ctrl-C.
+struct Foreground {
+    interrupt: Option<SigAction>,
+    quit: Option<SigAction>,
+    terminal: Option<Termios>,
+    /// The terminal's foreground process group, when it is our controlling terminal.
+    group: Option<Pid>,
+}
+
+impl Foreground {
+    /// Save the terminal and hand Ctrl-C (SIGINT, SIGQUIT) to Claude Code: the terminal
+    /// sends them to the whole foreground group, and the wrapper must outlive the session.
+    fn enter() -> Self {
+        let stdin = std::io::stdin();
+        let (terminal, group) = if stdin.is_terminal() {
+            (tcgetattr(&stdin).ok(), tcgetpgrp(&stdin).ok())
+        } else {
+            (None, None)
+        };
+        let ignore = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
+        // SAFETY: installs SIG_IGN, which runs no code in this process.
+        let (interrupt, quit) = unsafe {
+            (
+                sigaction(Signal::SIGINT, &ignore).ok(),
+                sigaction(Signal::SIGQUIT, &ignore).ok(),
+            )
+        };
+        Self {
+            interrupt,
+            quit,
+            terminal,
+            group,
+        }
+    }
+
+    /// The dispositions Claude Code should start with: whatever this process inherited.
+    fn child_dispositions(&self) -> (libc::sighandler_t, libc::sighandler_t) {
+        let inherited = |action: &Option<SigAction>| match action.map(|action| action.handler()) {
+            Some(SigHandler::SigIgn) => libc::SIG_IGN,
+            _ => libc::SIG_DFL,
+        };
+        (inherited(&self.interrupt), inherited(&self.quit))
     }
 }
 
-/// Pass SIGTERM and SIGHUP on to Claude Code; with no child running, exit as they would.
+impl Drop for Foreground {
+    fn drop(&mut self) {
+        // SAFETY: restores the dispositions saved in `enter`.
+        unsafe {
+            if let Some(action) = &self.interrupt {
+                let _ = sigaction(Signal::SIGINT, action);
+            }
+            if let Some(action) = &self.quit {
+                let _ = sigaction(Signal::SIGQUIT, action);
+            }
+        }
+        let stdin = std::io::stdin();
+        // If the session moved the terminal to another process group, take it back. Doing so
+        // from the background raises SIGTTOU, so ignore that while it happens.
+        if let Some(group) = &self.group
+            && tcgetpgrp(&stdin).ok() != Some(*group)
+        {
+            let ignore = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
+            // SAFETY: temporarily installs SIG_IGN and then restores the previous action.
+            unsafe {
+                if let Ok(previous) = sigaction(Signal::SIGTTOU, &ignore) {
+                    let _ = tcsetpgrp(&stdin, *group);
+                    let _ = sigaction(Signal::SIGTTOU, &previous);
+                }
+            }
+        }
+        if let Some(termios) = &self.terminal {
+            let _ = tcsetattr(&stdin, SetArg::TCSANOW, termios);
+        }
+    }
+}
+
+/// Pass SIGTERM and SIGHUP on to Claude Code, and SIGKILL it if it is still running after
+/// the grace period. With no session running, exit as those signals would.
 fn forward_signals() {
+    let grace = grace();
     let Ok(mut signals) = signal_hook::iterator::Signals::new([libc::SIGTERM, libc::SIGHUP]) else {
         return;
     };
     std::thread::spawn(move || {
-        for signal in signals.forever() {
-            match CHILD.load(Ordering::SeqCst) {
-                0 => std::process::exit(128 + signal),
-                pid => {
-                    // SAFETY: kill only sends a signal.
-                    unsafe { libc::kill(pid, signal) };
-                }
+        for number in signals.forever() {
+            let pid = CHILD.load(Ordering::SeqCst);
+            if pid == 0 {
+                std::process::exit(128 + number);
             }
+            if let Ok(signal) = Signal::try_from(number) {
+                let _ = kill(Pid::from_raw(pid), signal);
+            }
+            std::thread::spawn(move || {
+                std::thread::sleep(grace);
+                if CHILD.load(Ordering::SeqCst) == pid {
+                    let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+                }
+            });
         }
     });
+}
+
+/// Start Claude Code in this process group (it needs the terminal), killed and reaped if
+/// claude-oauth bails out early. On Linux the kernel also sends it SIGTERM if claude-oauth
+/// itself dies.
+fn spawn(mut command: Command, foreground: &Foreground) -> std::io::Result<Box<dyn ChildWrapper>> {
+    let (interrupt, quit) = foreground.child_dispositions();
+    // SAFETY: signal() is async-signal-safe.
+    unsafe {
+        command.pre_exec(move || {
+            libc::signal(libc::SIGINT, interrupt);
+            libc::signal(libc::SIGQUIT, quit);
+            Ok(())
+        });
+    }
+    let mut wrapped = CommandWrap::from(command);
+    wrapped.wrap(ResetSigmask);
+    #[cfg(target_os = "linux")]
+    wrapped.wrap(process_wrap::std::PropagateThreadDeath::default());
+    wrapped.wrap(KillOnDrop);
+    wrapped.spawn()
 }
 
 fn exit_code(status: std::process::ExitStatus) -> i32 {
@@ -358,23 +475,16 @@ pub fn session(
             .env(hook::RUN_ENV, &run)
             .env(hook::TOKEN_ENV, fingerprint(&account.token));
         with_account(&mut command, &account);
-        // Ctrl-C belongs to Claude Code, as it would without the wrapper.
-        set_interrupts(true);
-        // SAFETY: signal() is async-signal-safe.
-        unsafe {
-            command.pre_exec(|| {
-                libc::signal(libc::SIGINT, libc::SIG_DFL);
-                libc::signal(libc::SIGQUIT, libc::SIG_DFL);
-                Ok(())
-            });
-        }
-        let mut child = command
-            .spawn()
-            .with_context(|| format!("Could not start {}", claude.display()))?;
-        CHILD.store(child.id() as i32, Ordering::SeqCst);
-        let status = child.wait();
-        CHILD.store(0, Ordering::SeqCst);
-        set_interrupts(false);
+        let status = {
+            let foreground = Foreground::enter();
+            let mut child = spawn(command, &foreground)
+                .with_context(|| format!("Could not start {}", claude.display()))?;
+            CHILD.store(child.id() as i32, Ordering::SeqCst);
+            let status = child.wait();
+            CHILD.store(0, Ordering::SeqCst);
+            status
+            // `foreground` restores signals and the terminal here, before any prompt.
+        };
         let code = exit_code(status?);
         tried.insert(fingerprint(&account.token));
 

@@ -76,7 +76,16 @@ When a session ends because of its account, claude-oauth says why. If another ac
 
 Switching reopens the same conversation with `claude --resume <session>` on the next account. An interactive session reopens as it was; options from the first launch, such as `--model`, are not repeated. A `-p` run is repeated with its original arguments in the resumed session, because the failed turn produced no answer. If the failure came before any turn started, the same command runs again with the next account. `proxy` takes no options of its own, so set `CLAUDE_OAUTH_ON_LIMIT=ask|switch|stop` instead.
 
-Ctrl-C reaches Claude Code as usual, and claude-oauth waits for it to exit. SIGTERM and SIGHUP sent to claude-oauth are passed on to Claude Code. claude-oauth exits with Claude Code's exit status.
+### Process handling
+
+claude-oauth uses [`process-wrap`](https://crates.io/crates/process-wrap), `nix` and `signal-hook` so that no process outlives the job it belongs to and the terminal is always handed back:
+
+- A monitored session runs in claude-oauth's own process group, so Claude Code keeps the terminal. Ctrl-C reaches Claude Code as usual. claude-oauth ignores it, waits for Claude Code to exit, and exits with its status. Claude Code starts with the signal dispositions and signal mask that claude-oauth inherited.
+- SIGTERM and SIGHUP sent to claude-oauth are passed on to Claude Code. If it is still running 10 seconds later (`CLAUDE_OAUTH_KILL_GRACE` sets the number of seconds), it is killed with SIGKILL.
+- The terminal settings and foreground process group are saved before Claude Code starts and restored when it exits, even if it crashed in raw mode.
+- If claude-oauth itself fails after starting Claude Code, Claude Code is killed and reaped. On Linux, the kernel also sends Claude Code SIGTERM if claude-oauth dies (`PR_SET_PDEATHSIG`). macOS has no such mechanism, so after a `kill -9` of claude-oauth, Claude Code continues until the terminal closes.
+- `add` runs `claude setup-token` in a separate session and process group on a private pseudo-terminal. When `add` finishes, fails or is interrupted, the whole group is killed and reaped, the reader thread ends, and the temporary profile is deleted.
+- The account store and `state.json` are written through randomly named temporary files and renamed into place. The lock is waited for at most 5 seconds, so a hook never hangs a Claude Code session. claude-oauth exits with Claude Code's exit status.
 
 `list` shows what was last learned, without network access. `check` asks Anthropic again and updates it. Tokens created with `add` are valid for a year, so `list` and `check` warn during the last 30 days.
 
@@ -161,7 +170,7 @@ cargo test
 cargo clippy --all-targets
 ```
 
-The setup-token test drives a scripted fake `claude` through a real pseudo-terminal. `tests/monitor.rs` uses a fake `claude` that calls the `--settings` hooks the way Claude Code does, including dropping the token from the hook's environment. It covers switching, stopping, rejected tokens, the direct token check and signal handling. `tests/fixtures/relayline-backup.json` was made by Relayline and keeps the backup format compatible.
+The setup-token test drives a scripted fake `claude` through a real pseudo-terminal. `tests/monitor.rs` uses a fake `claude` that calls the `--settings` hooks the way Claude Code does, including dropping the token from the hook's environment. It covers switching, stopping, rejected tokens and the direct token check. It also covers Ctrl-C, forwarded SIGTERM, the SIGKILL after the grace period, and restoring a terminal left in raw mode. The setup tests also check that a process started by the fake `claude setup-token` and the temporary profile are gone afterwards. `tests/fixtures/relayline-backup.json` was made by Relayline and keeps the backup format compatible.
 
 ## License
 

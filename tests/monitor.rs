@@ -339,3 +339,58 @@ fn sigterm_to_the_wrapper_is_passed_on() {
         (Some(100 + libc::SIGTERM), format!("{}\n", libc::SIGTERM))
     );
 }
+
+#[test]
+fn a_session_that_ignores_sigterm_is_killed_after_the_grace_period() {
+    use std::os::unix::process::CommandExt;
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.path("claude"),
+        "#!/usr/bin/env python3\nimport os, signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\n\
+         open(os.environ['FAKE_LOG'] + '.ready', 'w').close()\ntime.sleep(60)\n",
+    )
+    .unwrap();
+    let mut command = fixture.command(OFFLINE, &["run", "-q"]);
+    command
+        .env("CLAUDE_OAUTH_KILL_GRACE", "0.5")
+        .process_group(0);
+    let mut child = command.spawn().unwrap();
+    let ready = fixture.path("log.ready");
+    let started = std::time::Instant::now();
+    while !ready.exists() {
+        assert!(
+            started.elapsed().as_secs() < 10,
+            "the fake session did not start"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let signalled = std::time::Instant::now();
+    // SAFETY: only sends a signal.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(128 + libc::SIGKILL));
+    assert!(signalled.elapsed() < std::time::Duration::from_secs(5));
+}
+
+#[test]
+fn the_terminal_is_restored_after_claude_leaves_it_raw() {
+    use nix::sys::termios::{LocalFlags, tcgetattr};
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.path("claude"),
+        "#!/usr/bin/env python3\nimport sys, tty\ntty.setraw(sys.stdin.fileno())\n",
+    )
+    .unwrap();
+    let pty = nix::pty::openpty(None, None).unwrap();
+    let cooked = tcgetattr(&pty.slave).unwrap().local_flags;
+    assert!(cooked.contains(LocalFlags::ICANON | LocalFlags::ECHO));
+    let mut command = fixture.command(OFFLINE, &["run", "-q"]);
+    command.stdin(Stdio::from(pty.slave.try_clone().unwrap()));
+    let status = command.status().unwrap();
+    assert_eq!(status.code(), Some(0));
+    let after = tcgetattr(&pty.slave).unwrap().local_flags;
+    assert!(
+        after.contains(LocalFlags::ICANON | LocalFlags::ECHO),
+        "{after:?}"
+    );
+}

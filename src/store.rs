@@ -163,9 +163,7 @@ impl Store {
             .mode(0o600)
             .open(self.dir.join(".lock"))
             .context("Could not open the store lock.")?;
-        let _lock = nix::fcntl::Flock::lock(lock, nix::fcntl::FlockArg::LockExclusive)
-            .map_err(|(_, error)| error)
-            .context("Could not lock the account store.")?;
+        let _lock = acquire(lock)?;
         work()
     }
 
@@ -198,6 +196,33 @@ impl Store {
     }
 }
 
+/// Wait at most `LOCK_WAIT` for the store lock, so a stuck process can never hang a hook
+/// (and with it a Claude Code session) or a command.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn acquire(file: File) -> Result<nix::fcntl::Flock<File>> {
+    use nix::errno::Errno;
+    use nix::fcntl::{Flock, FlockArg};
+    let deadline = std::time::Instant::now() + LOCK_WAIT;
+    let mut file = file;
+    loop {
+        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(lock) => return Ok(lock),
+            Err((returned, Errno::EWOULDBLOCK | Errno::EINTR))
+                if std::time::Instant::now() < deadline =>
+            {
+                file = returned;
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err((_, Errno::EWOULDBLOCK)) => bail!(
+                "Another claude-oauth process has held the account store lock for over {} seconds.",
+                LOCK_WAIT.as_secs()
+            ),
+            Err((_, error)) => return Err(error).context("Could not lock the account store."),
+        }
+    }
+}
+
 fn load<T: serde::de::DeserializeOwned + Default>(path: &Path, what: &str) -> Result<T> {
     match fs::read_to_string(path) {
         Ok(text) => serde_json::from_str(&text)
@@ -208,23 +233,19 @@ fn load<T: serde::de::DeserializeOwned + Default>(path: &Path, what: &str) -> Re
 }
 
 fn save<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let temporary = path.with_file_name(format!(".{name}-{}.tmp", std::process::id()));
+    // A randomly named 0600 file in the same directory, removed on drop unless persisted, so
+    // an interrupted write never leaves a partial file in place or blocks the next one.
     let result = (|| {
-        let mut file: File = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(&temporary)?;
+        let directory = path.parent().unwrap_or(Path::new("."));
+        let mut file = tempfile::Builder::new()
+            .prefix(".claude-oauth-")
+            .tempfile_in(directory)?;
         file.write_all(serde_json::to_string_pretty(value)?.as_bytes())?;
         file.write_all(b"\n")?;
-        file.sync_all()?;
-        fs::rename(&temporary, path)?;
+        file.as_file().sync_all()?;
+        file.persist(path)?;
         anyhow::Ok(())
     })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
     result.with_context(|| format!("Could not write {}", path.display()))
 }
 
@@ -258,6 +279,24 @@ mod tests {
         let read = store.read().unwrap();
         assert_eq!(read.accounts, vec![account("work", "aaa")]);
         assert_eq!(read.default.as_deref(), Some("work"));
+    }
+
+    #[test]
+    fn gives_up_on_a_lock_held_too_long() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        store.update(|_| Ok(())).unwrap();
+        let held = nix::fcntl::Flock::lock(
+            File::open(dir.path().join(".lock")).unwrap(),
+            nix::fcntl::FlockArg::LockExclusive,
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let error = store.update(|_| Ok(())).unwrap_err().to_string();
+        assert!(error.contains("held the account store lock"), "{error}");
+        assert!(started.elapsed() >= LOCK_WAIT);
+        drop(held);
+        store.update(|_| Ok(())).unwrap();
     }
 
     #[test]
