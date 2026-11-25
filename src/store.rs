@@ -1,4 +1,5 @@
-//! The local account store: one JSON file with owner-only permissions.
+//! The local account store (`accounts.json`) and the last-known account state
+//! (`state.json`), both owner-only files updated atomically under one lock.
 
 use anyhow::{Context, Result, bail};
 use regex::Regex;
@@ -6,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 static TOKEN: LazyLock<Regex> =
@@ -30,6 +31,9 @@ pub struct Account {
     pub token: String,
     #[serde(default)]
     pub paused: bool,
+    /// Unix time Claude Code issued the token through `add`; unknown for pasted or restored tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<i64>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -137,23 +141,20 @@ impl Store {
             .with_context(|| format!("Could not create {}", self.dir.display()))
     }
 
-    pub fn read(&self) -> Result<Accounts> {
-        match fs::read_to_string(self.file()) {
-            Ok(text) => serde_json::from_str(&text).with_context(|| {
-                format!(
-                    "The account store at {} is not valid JSON.",
-                    self.file().display()
-                )
-            }),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Accounts::default()),
-            Err(error) => {
-                Err(error).with_context(|| format!("Could not read {}", self.file().display()))
-            }
-        }
+    pub fn state_file(&self) -> PathBuf {
+        self.dir.join("state.json")
     }
 
-    /// Read, change and atomically rewrite the store while holding an exclusive lock.
-    pub fn update<T>(&self, change: impl FnOnce(&mut Accounts) -> Result<T>) -> Result<T> {
+    pub fn read(&self) -> Result<Accounts> {
+        load(&self.file(), "account store")
+    }
+
+    pub fn read_state(&self) -> crate::state::State {
+        // State is a cache: a damaged file only costs a fresh check.
+        load(&self.state_file(), "state").unwrap_or_default()
+    }
+
+    fn locked<T>(&self, work: impl FnOnce() -> Result<T>) -> Result<T> {
         self.ensure_dir()?;
         let lock = OpenOptions::new()
             .create(true)
@@ -165,40 +166,66 @@ impl Store {
         let _lock = nix::fcntl::Flock::lock(lock, nix::fcntl::FlockArg::LockExclusive)
             .map_err(|(_, error)| error)
             .context("Could not lock the account store.")?;
-        let mut accounts = self.read()?;
-        let result = change(&mut accounts)?;
-        if accounts
-            .default
-            .as_deref()
-            .is_some_and(|name| !accounts.has_name(name))
-        {
-            accounts.default = None;
-        }
-        self.write(&accounts)?;
-        Ok(result)
+        work()
     }
 
-    fn write(&self, accounts: &Accounts) -> Result<()> {
-        let temporary = self
-            .dir
-            .join(format!(".accounts-{}.tmp", std::process::id()));
-        let result = (|| {
-            let mut file: File = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .mode(0o600)
-                .open(&temporary)?;
-            file.write_all(serde_json::to_string_pretty(accounts)?.as_bytes())?;
-            file.write_all(b"\n")?;
-            file.sync_all()?;
-            fs::rename(&temporary, self.file())?;
-            anyhow::Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result.with_context(|| format!("Could not write {}", self.file().display()))
+    /// Read, change and atomically rewrite the account store while holding the lock.
+    pub fn update<T>(&self, change: impl FnOnce(&mut Accounts) -> Result<T>) -> Result<T> {
+        self.locked(|| {
+            let mut accounts = self.read()?;
+            let result = change(&mut accounts)?;
+            if accounts
+                .default
+                .as_deref()
+                .is_some_and(|name| !accounts.has_name(name))
+            {
+                accounts.default = None;
+            }
+            save(&self.file(), &accounts)?;
+            Ok(result)
+        })
     }
+
+    /// Read, change and rewrite the state file while holding the lock.
+    pub fn update_state<T>(&self, change: impl FnOnce(&mut crate::state::State) -> T) -> Result<T> {
+        self.locked(|| {
+            let mut state = self.read_state();
+            let result = change(&mut state);
+            state.prune(chrono::Utc::now().timestamp());
+            save(&self.state_file(), &state)?;
+            Ok(result)
+        })
+    }
+}
+
+fn load<T: serde::de::DeserializeOwned + Default>(path: &Path, what: &str) -> Result<T> {
+    match fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text)
+            .with_context(|| format!("The {what} at {} is not valid JSON.", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
+        Err(error) => Err(error).with_context(|| format!("Could not read {}", path.display())),
+    }
+}
+
+fn save<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let temporary = path.with_file_name(format!(".{name}-{}.tmp", std::process::id()));
+    let result = (|| {
+        let mut file: File = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(serde_json::to_string_pretty(value)?.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        anyhow::Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.with_context(|| format!("Could not write {}", path.display()))
 }
 
 #[cfg(test)]
@@ -211,6 +238,7 @@ mod tests {
             name: name.into(),
             token: format!("sk-ant-oat01-{suffix}"),
             paused: false,
+            created_at: None,
         }
     }
 
