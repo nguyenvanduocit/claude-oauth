@@ -19,7 +19,7 @@ clap = { version = "4.6.10", features = ["derive"] }
 ctrlc = "3.5.3"
 libc = "0.2.191"
 nix = { version = "0.32", features = ["term", "process", "signal", "fs"] }
-process-wrap = { version = "11", default-features = false, features = ["std", "kill-on-drop", "process-group", "process-session", "reset-sigmask", "propagate-thread-death"] }
+process-wrap = { version = "11", default-features = false, features = ["std", "kill-on-drop", "process-group", "process-session", "reset-sigmask"] }
 rand = "0.8"
 regex = "1.13.2"
 rpassword = "7.5.5"

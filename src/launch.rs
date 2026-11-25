@@ -384,18 +384,29 @@ fn forward_signals() {
 /// itself dies.
 fn spawn(mut command: Command, foreground: &Foreground) -> std::io::Result<Box<dyn ChildWrapper>> {
     let (interrupt, quit) = foreground.child_dispositions();
-    // SAFETY: signal() is async-signal-safe.
+    #[cfg(target_os = "linux")]
+    let parent = std::process::id() as libc::pid_t;
+    // SAFETY: signal(), prctl(), getppid() and raise() are async-signal-safe.
     unsafe {
         command.pre_exec(move || {
             libc::signal(libc::SIGINT, interrupt);
             libc::signal(libc::SIGQUIT, quit);
+            // Linux: SIGTERM to Claude Code if claude-oauth dies. If it already died before
+            // this point, act on that now.
+            #[cfg(target_os = "linux")]
+            {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != parent {
+                    libc::raise(libc::SIGTERM);
+                }
+            }
             Ok(())
         });
     }
     let mut wrapped = CommandWrap::from(command);
     wrapped.wrap(ResetSigmask);
-    #[cfg(target_os = "linux")]
-    wrapped.wrap(process_wrap::std::PropagateThreadDeath::default());
     wrapped.wrap(KillOnDrop);
     wrapped.spawn()
 }
