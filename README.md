@@ -14,6 +14,12 @@ claude-oauth run --auto        # …or the working account with the most quota l
 ## Install
 
 ```sh
+brew install nguyenvanduocit/tap/claude-oauth
+```
+
+Prebuilt binaries for macOS (Apple Silicon and Intel) and Linux (x86_64 and arm64, static) are attached to every [release](https://github.com/nguyenvanduocit/claude-oauth/releases). To build from source:
+
+```sh
 cargo install --git https://github.com/nguyenvanduocit/claude-oauth
 ```
 
@@ -58,6 +64,16 @@ alias claude='claude-oauth run -q --'
 ## Storage and security
 
 Accounts are stored in `~/.config/claude-oauth/accounts.json` (or `$XDG_CONFIG_HOME/claude-oauth`, or `$CLAUDE_OAUTH_HOME`). The directory is `0700` and the file is `0600`. Updates are atomic and lock the file. Tokens are stored in plain text inside this file, the same way Claude Code keeps credentials on Linux. Only `env` prints a token. Tokens are sent only to `api.anthropic.com`, for the health and quota checks, and to the `claude` process.
+
+## Releasing
+
+Bump `version` in `Cargo.toml`, commit, then push a matching tag:
+
+```sh
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+`.github/workflows/release.yml` checks that the tag matches `Cargo.toml` and runs the tests. It then builds the four binaries, publishes the GitHub Release with `checksums.txt`, and writes `claude-oauth.rb` into [nguyenvanduocit/homebrew-tap](https://github.com/nguyenvanduocit/homebrew-tap). A tag with a suffix such as `v0.2.0-rc.1` becomes a prerelease and does not update the tap. The tap is written with the `HOMEBREW_TAP_DEPLOY_KEY` secret, an SSH deploy key that can push only to the tap.
 
 ## Development
 
