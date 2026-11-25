@@ -382,7 +382,7 @@ mod tests {
         );
         // Claude Code 2.1.3xx: an OSC 8 hyperlink to an opaque request handle.
         let opaque =
-            "https://claude.ai/oauth/authorize?I_15zmqDQMQTX3b4G1ci1PErhePyF_xocuixMBu0mNUo";
+            "https://claude.ai/oauth/authorize?fixture_request_handle_0123456789abcdefXYZ";
         assert_eq!(
             authorize_link(&format!(
                 "\x1b]8;id=1sph63i;{opaque}\x07\x1b[38;5;246m{opaque}\x1b[39m\x1b]8;;\x07\r\n"
