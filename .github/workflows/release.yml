@@ -133,7 +133,6 @@ jobs:
           class ClaudeOauth < Formula
             desc "Manage Claude Code OAuth tokens across accounts and run Claude with any of them"
             homepage "https://github.com/$GITHUB_REPOSITORY"
-            version "$VERSION"
             license "MIT"
 
             on_macos do
